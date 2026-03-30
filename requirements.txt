@@ -1,0 +1,4 @@
+# Currently stdlib only — add packages here as needed
+# Example future additions:
+# redis>=5.0
+# pyzmq>=25.0

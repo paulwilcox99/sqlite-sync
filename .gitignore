@@ -1,0 +1,6 @@
+venv/
+simulation.db
+__pycache__/
+*.pyc
+*.db-shm
+*.db-wal
