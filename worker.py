@@ -3,13 +3,6 @@ Worker process for the SQLite lockstep simulation.
 
 Usage:
     python worker.py <worker_id>
-
-The worker:
-  1. Validates its ID exists in the registry.
-  2. Sets status=READY and waits for the simulation to start.
-  3. Runs a catch-up loop if the sim clock has advanced past its last event.
-  4. Runs the normal task loop until sim reaches DONE or its next event
-     is past SIM_END.
 """
 
 import random
@@ -19,212 +12,97 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
+from config import DB_PATH, POLL_INTERVAL_SECONDS, SIM_END, WORKERS
+
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-
-from config import DB_PATH, POLL_INTERVAL_SECONDS, SIM_END
 
 
 # ---------------------------------------------------------------------------
 # SQLite helpers
 # ---------------------------------------------------------------------------
 
-def open_db() -> sqlite3.Connection:
+def get_connection():
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
     return conn
 
 
-def db_execute_with_retry(conn, sql, params=(), max_retries=5):
-    """Retry on SQLite lock errors with exponential backoff."""
-    for attempt in range(max_retries):
+def db_execute(conn, sql, params=()):
+    for attempt in range(5):
         try:
             return conn.execute(sql, params)
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() and attempt < max_retries - 1:
+            if "locked" in str(e) and attempt < 4:
                 time.sleep(0.05 * (2 ** attempt))
             else:
                 raise
 
 
 # ---------------------------------------------------------------------------
+# Fail fast helper
+# ---------------------------------------------------------------------------
+
+def fatal(worker_id, message):
+    print(f"[{worker_id}] FATAL: {message}")
+    print(f"[{worker_id}] Run db_setup.py to reset and start over.")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Business logic — PRIMARY CUSTOMIZATION POINT
 # ---------------------------------------------------------------------------
 #
-# This is where real business logic goes for each worker.
+# This is the ONLY function that needs to change for real business logic.
+# No catchup guard needed — this is only ever called for live tasks.
+# Branch on worker_id for per-worker behavior.
+# Can open its own DB connection to read simulation state if needed.
 #
-# Rules:
-#   - Must return a POSITIVE INTEGER: sim hours until the next task.
-#   - The `is_catchup` flag MUST guard any side effects (API calls,
-#     external writes, emails, etc.). During catch-up, only compute
-#     and return — do NOT perform real-world actions.
-#   - Different workers can branch on `worker_id` for completely different
-#     schedules, data sources, or business rules.
-#   - The function may query the DB, read files, or call APIs as needed,
-#     provided side effects are skipped when is_catchup=True.
-#
-def get_next_event_hours(worker_id: str, sim_time: datetime,
-                         is_catchup: bool = False) -> int:
+def get_next_event_hours(worker_id: str, sim_time: datetime) -> int:
     """
     Return the number of simulation hours until this worker's next task.
-
     Replace or extend this implementation with real business logic.
-    Use is_catchup=True to skip any external side effects.
     """
-    interval = random.choice([1, 2, 4, 8, 12, 24, 48])
-
-    if is_catchup:
-        return interval
-
-    # Simulate variable real-world work duration
-    real_sleep = random.uniform(1, 3)
-    time.sleep(real_sleep)
-    print(f"[{worker_id}] Task at {sim_time.isoformat()}: "
-          f"will next act in {interval} sim hours")
-    return interval
+    hours = random.choice([1, 2, 4, 8, 12, 24, 48])
+    time.sleep(random.uniform(1, 3))
+    print(f"[{worker_id}] Task at {sim_time}: next in {hours} sim hours")
+    return hours
 
 
 # ---------------------------------------------------------------------------
-# Worker startup
+# Task loop
 # ---------------------------------------------------------------------------
 
-def validate_worker(conn, worker_id: str):
-    row = conn.execute(
-        "SELECT worker_id FROM worker_registry WHERE worker_id = ?",
-        (worker_id,),
-    ).fetchone()
-    if row is None:
-        print(f"ERROR: worker_id '{worker_id}' not found in worker_registry.")
-        print("Run db_setup.py first, and make sure the ID is listed in config.WORKERS.")
-        sys.exit(1)
-
-
-def set_status(conn, worker_id: str, status: str, extra_fields: dict | None = None):
-    """Atomically update worker status plus any extra fields."""
-    now_utc = _now_utc()
-    fields = {"status": status, "last_seen": now_utc}
-    if extra_fields:
-        fields.update(extra_fields)
-
-    set_clause = ", ".join(f"{k} = ?" for k in fields)
-    values = list(fields.values()) + [worker_id]
-    with conn:
-        db_execute_with_retry(
-            conn,
-            f"UPDATE worker_registry SET {set_clause} WHERE worker_id = ?",
-            values,
-        )
-
-
-def wait_for_running(conn, worker_id: str) -> tuple[str, datetime]:
-    """
-    Poll until sim_clock.status is RUNNING (or DONE).
-    Returns (clock_status, sim_time).
-    """
+def _run_task_loop(conn, worker_id: str):
     while True:
-        row = conn.execute("SELECT status, sim_time FROM sim_clock").fetchone()
-        clock_status = row["status"]
-        sim_time = datetime.fromisoformat(row["sim_time"])
-
-        if clock_status in ("RUNNING", "DONE"):
-            return clock_status, sim_time
-
-        # Refresh last_seen while waiting
-        with conn:
-            db_execute_with_retry(
-                conn,
-                "UPDATE worker_registry SET last_seen = ? WHERE worker_id = ?",
-                (_now_utc(), worker_id),
-            )
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-
-# ---------------------------------------------------------------------------
-# Catch-up logic
-# ---------------------------------------------------------------------------
-
-def run_catchup(conn, worker_id: str, sim_time: datetime):
-    """Replay all missed events from next_event_time up to sim_time."""
-    row = conn.execute(
-        "SELECT next_event_time, missed_events FROM worker_registry WHERE worker_id = ?",
-        (worker_id,),
-    ).fetchone()
-
-    next_evt = datetime.fromisoformat(row["next_event_time"])
-    total_missed = row["missed_events"]
-
-    if next_evt >= sim_time:
-        return  # Nothing to catch up
-
-    set_status(conn, worker_id, "CATCHUP")
-    print(
-        f"[{worker_id}] CATCHUP: sim is at {sim_time.isoformat()}, "
-        f"my last event was {row['next_event_time']}. Replaying missed events..."
-    )
-
-    replayed = 0
-    while next_evt <= sim_time:
-        hours = get_next_event_hours(worker_id, next_evt, is_catchup=True)
-        total_missed += 1
-        replayed += 1
-        new_next = next_evt + timedelta(hours=hours)
-        print(
-            f"[{worker_id}] CATCHUP: replayed event at {next_evt.isoformat()}, "
-            f"next at {new_next.isoformat()}"
-        )
-        next_evt = new_next
-
-    # Persist final position
-    with conn:
-        db_execute_with_retry(
-            conn,
-            "UPDATE worker_registry SET status = 'WAITING', "
-            "next_event_time = ?, missed_events = ?, last_seen = ? "
-            "WHERE worker_id = ?",
-            (next_evt.isoformat(), total_missed, _now_utc(), worker_id),
-        )
-
-    print(
-        f"[{worker_id}] CATCHUP complete. Replayed {replayed} missed events. "
-        f"Resuming normal operation at {next_evt.isoformat()}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Normal task loop
-# ---------------------------------------------------------------------------
-
-def run_task_loop(conn, worker_id: str):
-    while True:
+        # 1. Read sim_clock
         clock_row = conn.execute("SELECT status, sim_time FROM sim_clock").fetchone()
-        clock_status = clock_row["status"]
-        sim_time = datetime.fromisoformat(clock_row["sim_time"])
-
-        if clock_status == "DONE":
-            row = conn.execute(
-                "SELECT status, last_ack_time, next_event_time, missed_events "
-                "FROM worker_registry WHERE worker_id = ?",
+        if clock_row["status"] == "DONE":
+            my_row = conn.execute(
+                "SELECT last_ack_time, next_event_time FROM worker_registry "
+                "WHERE worker_id = ?",
                 (worker_id,),
             ).fetchone()
             print(
                 f"[{worker_id}] Simulation DONE. "
-                f"last_ack={row['last_ack_time']}, "
-                f"next_event={row['next_event_time']}, "
-                f"missed_events={row['missed_events']}"
+                f"last_ack={my_row['last_ack_time']}, "
+                f"next_event={my_row['next_event_time']}"
             )
             return
 
+        sim_time = datetime.fromisoformat(clock_row["sim_time"])
+
+        # 2. Read own row
         my_row = conn.execute(
             "SELECT status, next_event_time FROM worker_registry WHERE worker_id = ?",
             (worker_id,),
         ).fetchone()
 
-        # Refresh last_seen
+        # 3. Update last_seen on every poll
         with conn:
-            db_execute_with_retry(
+            db_execute(
                 conn,
                 "UPDATE worker_registry SET last_seen = ? WHERE worker_id = ?",
                 (_now_utc(), worker_id),
@@ -233,49 +111,61 @@ def run_task_loop(conn, worker_id: str):
         my_status = my_row["status"]
         next_evt = datetime.fromisoformat(my_row["next_event_time"])
 
+        # 4. Execute task if due and WAITING
         if sim_time >= next_evt and my_status == "WAITING":
-            # Set WORKING, execute task, then atomically write ACK + next_event_time
-            with conn:
-                db_execute_with_retry(
-                    conn,
-                    "UPDATE worker_registry SET status = 'WORKING', last_seen = ? "
-                    "WHERE worker_id = ?",
-                    (_now_utc(), worker_id),
-                )
-
-            hours = get_next_event_hours(worker_id, sim_time, is_catchup=False)
-            new_next = sim_time + timedelta(hours=hours)
-
-            if new_next > SIM_END:
-                with conn:
-                    db_execute_with_retry(
-                        conn,
-                        "UPDATE worker_registry SET status = 'DONE', "
-                        "next_event_time = ?, last_ack_time = ?, last_seen = ? "
-                        "WHERE worker_id = ?",
-                        (new_next.isoformat(), sim_time.isoformat(),
-                         _now_utc(), worker_id),
-                    )
-                print(f"[{worker_id}] No more events before SIM_END. Done.")
-                return
-
-            with conn:
-                db_execute_with_retry(
-                    conn,
-                    "UPDATE worker_registry SET status = 'ACK', "
-                    "next_event_time = ?, last_ack_time = ?, last_seen = ? "
-                    "WHERE worker_id = ?",
-                    (new_next.isoformat(), sim_time.isoformat(),
-                     _now_utc(), worker_id),
-                )
-
-            print(
-                f"[{worker_id}] ACK at sim_time {sim_time.isoformat()}, "
-                f"next task scheduled at {new_next.isoformat()} "
-                f"({hours} sim hours from now)"
-            )
+            _execute_task(conn, worker_id, sim_time)
         else:
             time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _execute_task(conn, worker_id: str, sim_time: datetime):
+    # 1. Set WORKING
+    with conn:
+        db_execute(
+            conn,
+            "UPDATE worker_registry SET status = 'WORKING', last_seen = ? "
+            "WHERE worker_id = ?",
+            (_now_utc(), worker_id),
+        )
+
+    # 2. Compute next event
+    hours = get_next_event_hours(worker_id, sim_time)
+    new_next = sim_time + timedelta(hours=hours)
+
+    # 3. If new_next > SIM_END: mark DONE and wait for sim to finish
+    if new_next > SIM_END:
+        with conn:
+            db_execute(
+                conn,
+                "UPDATE worker_registry "
+                "SET status = 'DONE', last_ack_time = ?, next_event_time = ? "
+                "WHERE worker_id = ?",
+                (sim_time.isoformat(), new_next.isoformat(), worker_id),
+            )
+        print(
+            f"[{worker_id}] Final task at {sim_time.isoformat()}. "
+            f"No more events before SIM_END. Waiting for DONE signal."
+        )
+        while True:
+            row = conn.execute("SELECT status FROM sim_clock").fetchone()
+            if row["status"] == "DONE":
+                return
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    # 4. ACK — write next_event_time and status atomically
+    with conn:
+        db_execute(
+            conn,
+            "UPDATE worker_registry "
+            "SET status = 'ACK', last_ack_time = ?, next_event_time = ? "
+            "WHERE worker_id = ?",
+            (sim_time.isoformat(), new_next.isoformat(), worker_id),
+        )
+
+    print(
+        f"[{worker_id}] ACK at {sim_time.isoformat()}, "
+        f"next task at {new_next.isoformat()} ({hours} sim hours from now)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,42 +173,80 @@ def run_task_loop(conn, worker_id: str):
 # ---------------------------------------------------------------------------
 
 def main(worker_id: str):
-    conn = open_db()
+    # 1. Validate worker_id is in config.WORKERS
+    if worker_id not in WORKERS:
+        print(f"ERROR: '{worker_id}' is not a registered worker. Valid IDs: {WORKERS}")
+        sys.exit(1)
+
+    # 2. Open DB connection
+    conn = get_connection()
+
     try:
-        validate_worker(conn, worker_id)
+        # 3. Verify sim_clock status is INIT or WAITING_FOR_WORKERS
+        row = conn.execute("SELECT status FROM sim_clock").fetchone()
+        status = row["status"]
+        if status in ("RUNNING", "DONE"):
+            fatal(
+                worker_id,
+                "Simulation already started. All workers must be present before "
+                "simulation begins. Run db_setup.py and restart.",
+            )
 
-        clock_row = conn.execute("SELECT status, sim_time FROM sim_clock").fetchone()
-        print(f"[{worker_id}] Online. Waiting for simulation to start...")
-
-        set_status(conn, worker_id, "READY")
-
-        # Wait for RUNNING (handles case where sim is already RUNNING on restart)
-        clock_status, sim_time = wait_for_running(conn, worker_id)
-
-        if clock_status == "DONE":
-            print(f"[{worker_id}] Simulation is already DONE. Nothing to do.")
-            return
-
-        # Catch-up check — always end in WAITING so the task loop can run
-        run_catchup(conn, worker_id, sim_time)
-        # run_catchup sets WAITING when it actually replays events; if no
-        # catch-up was needed, the worker is still READY — set WAITING now.
-        my_status = conn.execute(
-            "SELECT status FROM worker_registry WHERE worker_id = ?",
+        # 4. Check own row exists
+        row = conn.execute(
+            "SELECT worker_id FROM worker_registry WHERE worker_id = ?",
             (worker_id,),
-        ).fetchone()["status"]
-        if my_status == "READY":
-            set_status(conn, worker_id, "WAITING")
+        ).fetchone()
+        if row is None:
+            fatal(worker_id, "Worker not found in registry. Run db_setup.py to initialize.")
 
-        # Normal loop wrapped in error handler
+        # 5. Register
+        with conn:
+            db_execute(
+                conn,
+                "UPDATE worker_registry SET status = 'READY', last_seen = ? "
+                "WHERE worker_id = ?",
+                (_now_utc(), worker_id),
+            )
+
+        # 6. Print registered
+        print(f"[{worker_id}] Registered. Waiting for all workers and simulation start...")
+
+        # 7. Poll until sim_clock status == RUNNING
+        while True:
+            row = conn.execute("SELECT status FROM sim_clock").fetchone()
+            status = row["status"]
+            if status == "RUNNING":
+                break
+            if status == "DONE":
+                fatal(worker_id, "Simulation ended before this worker could start.")
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+        # 8. Print and transition to WAITING
+        print(f"[{worker_id}] Simulation is running. Entering task loop.")
+        with conn:
+            db_execute(
+                conn,
+                "UPDATE worker_registry SET status = 'WAITING', last_seen = ? "
+                "WHERE worker_id = ?",
+                (_now_utc(), worker_id),
+            )
+
+        # Main task loop — wrapped in try/except
         try:
-            run_task_loop(conn, worker_id)
+            _run_task_loop(conn, worker_id)
         except Exception:
             traceback.print_exc()
             try:
-                set_status(conn, worker_id, "ERROR")
+                with conn:
+                    db_execute(
+                        conn,
+                        "UPDATE worker_registry SET status = 'ERROR' WHERE worker_id = ?",
+                        (worker_id,),
+                    )
             except Exception:
                 pass
+            print(f"[{worker_id}] Worker failed. Run db_setup.py to reset.")
             sys.exit(1)
 
     finally:

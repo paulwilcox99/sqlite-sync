@@ -1,15 +1,16 @@
 # SQLite Lockstep Simulation
 
 A simulated time coordination system using SQLite and a lockstep clock pattern.
-Workers operate on dynamic task schedules. The system handles late-joining workers,
-worker restarts, and ensures no events are missed at startup or during recovery.
+Workers have dynamic task schedules. All workers must be present before the
+simulation starts (enforced by a ready gate). If any worker or the controller
+crashes, the simulation errors out and must be restarted fresh from db_setup.py.
 
 ## Prerequisites
 
 - Python 3.9 or higher
 - No external packages required (stdlib only)
 
-## Setup (do this once)
+## Setup (run once per simulation)
 
 **Unix/Mac:**
 ```bash
@@ -25,19 +26,20 @@ venv\Scripts\activate
 
 ## Running the Simulation
 
-**Step 1 — Initialize the database** (run once, or to reset):
+**Step 1 — Initialize the database** (required before every run):
 ```bash
 python db_setup.py
 ```
 
 **Step 2 — Start the controller** in its own terminal:
 ```bash
-source venv/bin/activate   # or venv\Scripts\activate on Windows
+source venv/bin/activate
 python controller.py
 ```
 The controller waits up to `READY_TIMEOUT_SECONDS` for all workers.
+Do not let this timeout expire — start all workers promptly.
 
-**Step 3 — Start each worker** in its own terminal:
+**Step 3 — Start all workers** within the timeout window:
 ```bash
 # Terminal 2
 source venv/bin/activate && python worker.py worker_a
@@ -49,58 +51,44 @@ source venv/bin/activate && python worker.py worker_b
 source venv/bin/activate && python worker.py worker_c
 ```
 
-Start workers within the `READY_TIMEOUT` window for a clean synchronized start.
-Workers started after the timeout will catch up automatically.
+ALL workers must be running before `READY_TIMEOUT_SECONDS` elapses.
+The controller will not start until every registered worker checks in.
 
-## What to Expect
+## Operational Rules
 
-- Controller prints each sim time advance
-- Workers print task execution and ACK messages
-- Late-joining workers print CATCHUP progress
-- Simulation ends when `sim_time` passes `SIM_END`
+- Always run `db_setup.py` before starting a new simulation
+- Start all workers before the ready timeout expires
+- If any process crashes, the simulation is over
+- Do not restart a crashed worker and expect it to rejoin —
+  it will be rejected because the simulation is already RUNNING
 
-## Worker Status Reference
+## If Something Goes Wrong
 
-| Status   | Meaning                                              |
-|----------|------------------------------------------------------|
-| OFFLINE  | Not yet started or never checked in                  |
-| READY    | Started, waiting for sim to begin                    |
-| WAITING  | Idle, waiting for `next_event_time`                  |
-| WORKING  | Executing current task                               |
-| ACK      | Task done, waiting for controller to advance clock   |
-| CATCHUP  | Replaying missed events after late start or restart  |
-| DONE     | No more events before `SIM_END`                      |
-| ERROR    | Crashed — check terminal output for traceback        |
+Any crash means the simulation state is invalid. Recovery is always:
+1. `python db_setup.py`
+2. Restart controller and all workers
+
+## Live Inspection
+
+You can query the SQLite database directly while the simulation runs:
+```bash
+sqlite3 simulation.db "SELECT * FROM sim_clock;"
+sqlite3 simulation.db "SELECT * FROM worker_registry;"
+sqlite3 simulation.db "SELECT worker_id, status, next_event_time, last_ack_time FROM worker_registry ORDER BY next_event_time;"
+```
 
 ## Adding a New Worker
 
 1. Add the worker ID to `config.WORKERS`
-2. Run `db_setup.py` again (this resets the simulation)
-3. Start the new worker: `python worker.py <new_worker_id>`
+2. Run `db_setup.py` (resets the simulation)
+3. Start: `python worker.py <new_worker_id>`
 
 ## Customizing Task Logic
 
 Edit `get_next_event_hours()` in `worker.py`.
-
-```python
-def get_next_event_hours(worker_id: str, sim_time: datetime,
-                          is_catchup: bool = False) -> int:
-```
-
-- Returns a **positive integer**: sim hours until the next task
-- Use `is_catchup=True` to skip side effects during catch-up replay
-- Branch on `worker_id` for completely different per-worker behavior
-- May query the DB, read files, or call APIs — but guard all side effects with `is_catchup`
-
-## Restarting a Crashed Worker
-
-Simply re-run:
-```bash
-python worker.py <worker_id>
-```
-
-The worker detects missed events, runs catch-up automatically, and rejoins
-the simulation without any manual intervention.
+Return a positive integer: sim hours until next task.
+Branch on `worker_id` for completely different behavior per worker.
+No catchup flag — this function is only ever called for live tasks.
 
 ## Resetting the Simulation
 
@@ -108,42 +96,26 @@ the simulation without any manual intervention.
 python db_setup.py
 ```
 
-This wipes all state and starts fresh from `SIM_START`.
+Drops and recreates all tables, returns to clean INIT state.
 
-## Configuration (`config.py`)
+## Architecture Summary
 
-| Constant                | Default              | Description                                   |
-|-------------------------|----------------------|-----------------------------------------------|
-| `SIM_START`             | `2026-01-01`         | Simulation start datetime                     |
-| `SIM_END`               | `2026-03-31`         | Simulation end datetime                       |
-| `DB_PATH`               | `simulation.db`      | SQLite database file path                     |
-| `POLL_INTERVAL_SECONDS` | `1`                  | How often workers/controller poll the DB      |
-| `WORKER_TIMEOUT_SECONDS`| `30`                 | Stall warning threshold (seconds)             |
-| `READY_TIMEOUT_SECONDS` | `120`                | How long controller waits for workers at startup |
-| `WORKERS`               | `[worker_a, b, c]`   | Registered worker IDs                         |
+| Component | Role |
+|-----------|------|
+| `sim_clock` table | Single row — owns the current simulation time and overall status. Controller is the only writer. |
+| `worker_registry` | One row per worker. Workers write their own `next_event_time` and status. Controller reads `next_event_time` to find the minimum (next clock target) and resets status from ACK to WAITING each cycle. |
+| Polling | Workers and controller poll the DB on `POLL_INTERVAL_SECONDS`. WAL mode allows concurrent reads without blocking. |
+| Ready gate | Controller stays in WAITING_FOR_WORKERS until all registered workers have `status=READY`. Fatal if any worker missing after timeout. |
+| Clock advance | Next-event driven — jumps to `MIN(next_event_time)` across all active workers. Never wastes cycles on empty sim time. |
 
-## Architecture
+## Worker Status Reference
 
-```
-controller.py          worker_a     worker_b     worker_c
-     |                    |            |            |
-     |-- WAITING_FOR_WORKERS                        |
-     |<-- READY ----------|<-- READY --|            |
-     |-- RUNNING                                    |
-     |                    |-- WORKING  |            |
-     |                    |-- ACK      |            |
-     |                                |-- WORKING   |
-     |                                |-- ACK       |
-     |-- advance sim_time                           |
-     |                                              |-- READY (late join)
-     |                                              |-- CATCHUP
-     |                                              |-- WAITING
-     ...
-```
-
-### SQLite Concurrency
-
-- WAL journal mode on all connections for concurrent reads during writes
-- Exponential backoff retry (up to 5 attempts) on `SQLITE_BUSY` errors
-- `PRAGMA busy_timeout=5000` as a coarser backstop
-- All multi-field writes in explicit transactions (`BEGIN IMMEDIATE`)
+| Status | Meaning |
+|--------|---------|
+| OFFLINE | Not yet started; set by db_setup.py |
+| READY | Worker checked in, waiting for RUNNING |
+| WAITING | Sim is RUNNING, worker idle until `next_event_time` |
+| WORKING | Worker actively executing task |
+| ACK | Task complete, `next_event_time` written, awaiting controller reset |
+| DONE | Worker's `next_event_time` has passed SIM_END |
+| ERROR | Worker encountered unhandled exception |

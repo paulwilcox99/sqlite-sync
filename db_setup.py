@@ -1,10 +1,16 @@
 import sqlite3
-from config import DB_PATH, SIM_START, WORKERS
+import config
+
+
+def get_connection():
+    conn = sqlite3.connect(config.DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def setup():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = get_connection()
 
     with conn:
         conn.execute("DROP TABLE IF EXISTS sim_clock")
@@ -20,42 +26,51 @@ def setup():
         conn.execute("""
             CREATE TABLE worker_registry (
                 worker_id       TEXT PRIMARY KEY,
-                status          TEXT    NOT NULL DEFAULT 'OFFLINE',
+                status          TEXT NOT NULL DEFAULT 'OFFLINE',
                 last_seen       TEXT,
                 last_ack_time   TEXT,
-                next_event_time TEXT,
-                missed_events   INTEGER NOT NULL DEFAULT 0
+                next_event_time TEXT
             )
         """)
 
         conn.execute(
             "INSERT INTO sim_clock (sim_time, status) VALUES (?, ?)",
-            (SIM_START.isoformat(), "INIT"),
+            (config.SIM_START.isoformat(), "INIT"),
         )
 
-        for wid in WORKERS:
+        for wid in config.WORKERS:
             conn.execute(
-                """INSERT INTO worker_registry
-                   (worker_id, status, last_seen, last_ack_time, next_event_time, missed_events)
-                   VALUES (?, 'OFFLINE', NULL, NULL, ?, 0)""",
-                (wid, SIM_START.isoformat()),
+                "INSERT INTO worker_registry "
+                "(worker_id, status, last_seen, last_ack_time, next_event_time) "
+                "VALUES (?, 'OFFLINE', NULL, NULL, ?)",
+                (wid, config.SIM_START.isoformat()),
             )
 
-    print("Database initialised.")
+    print("Database initialized.")
     print()
 
     row = conn.execute("SELECT sim_time, status FROM sim_clock").fetchone()
-    print(f"  sim_clock: sim_time={row[0]}, status={row[1]}")
+    print(f"  sim_clock: sim_time={row['sim_time']}, status={row['status']}")
+    print()
 
     workers = conn.execute(
-        "SELECT worker_id, status, next_event_time, last_ack_time, missed_events "
+        "SELECT worker_id, status, next_event_time, last_ack_time "
         "FROM worker_registry ORDER BY worker_id"
     ).fetchall()
     for w in workers:
-        print(f"  {w[0]}: status={w[1]}, next_event_time={w[2]}, "
-              f"last_ack_time={w[3]}, missed_events={w[4]}")
+        print(
+            f"  {w['worker_id']}: status={w['status']}, "
+            f"next_event_time={w['next_event_time']}, "
+            f"last_ack_time={w['last_ack_time']}"
+        )
 
     conn.close()
+
+    print()
+    print(
+        f"Database initialized. Start controller.py then start all workers "
+        f"within {config.READY_TIMEOUT_SECONDS} seconds."
+    )
 
 
 if __name__ == "__main__":
